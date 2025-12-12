@@ -1,0 +1,9 @@
+.env
+/logs
+__pycache__/
+*.json
+articles/
+articles_images/
+create_user.py
+hash_password.py
+*.db
