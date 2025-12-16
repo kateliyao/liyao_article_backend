@@ -1,16 +1,16 @@
 import json
 import os
+import boto3
+import mimetypes
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required
 from werkzeug.security import check_password_hash
-
-import boto3
+from datetime import timedelta
 from botocore.client import Config
-import mimetypes
-import requests
 
 # ===========================
 # ENV + Flask 初始化
@@ -18,6 +18,7 @@ import requests
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
+print("========== APP START ==========")
 
 IMAGE_FOLDER = "./articles_images"
 NEWS_FOLDER = "./articles"
@@ -34,6 +35,7 @@ CF_API_TOKEN = os.getenv("CF_API_TOKEN")
 KV_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_NAMESPACE_ID}/values"
 
 app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)  # 一小時過期，需要刷新網頁才能正常使用
 jwt = JWTManager(app)
 
 # ===========================
@@ -116,6 +118,7 @@ def login():
 @app.route("/save", methods=["POST"])
 @jwt_required()
 def save():
+    print("JWT ok, checking API Key...", request.headers.get("X-API-KEY"))
     if request.headers.get("X-API-KEY") != API_KEY:
         return jsonify({"error": "Invalid API Key"}), 401
 
@@ -164,5 +167,6 @@ def save():
 # MAIN（本地測試）
 # ===========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 8080))
+    print("Starting server on port:", port)
+    app.run(host="0.0.0.0", port=port)
