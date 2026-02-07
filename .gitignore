@@ -5,5 +5,4 @@ __pycache__/
 articles/
 articles_images/
 create_user.py
-hash_password.py
 *.db

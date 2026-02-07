@@ -11,6 +11,7 @@ from flask_jwt_extended import JWTManager, create_access_token, jwt_required
 from werkzeug.security import check_password_hash
 from datetime import timedelta
 from botocore.client import Config
+from flask import send_from_directory
 
 # ===========================
 # ENV + Flask 初始化
@@ -37,6 +38,13 @@ KV_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/st
 app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=1)  # 一小時過期，需要刷新網頁才能正常使用
 jwt = JWTManager(app)
+
+# 修正 CORS 設定：明確允許 DELETE 方法與相關 Headers
+CORS(app, resources={r"/*": {
+    "origins": "*",
+    "methods": ["GET", "POST", "DELETE", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization", "X-API-KEY"]
+}})
 
 # ===========================
 # R2 相關函式
@@ -127,6 +135,10 @@ def save():
         data = json.loads(raw_data)
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
+        # 定義路徑（確保這幾行在最前面）
+        local_articles_json = os.path.join(os.getcwd(), "articles.json")
+        print(f"--- 準備寫入索引檔: {local_articles_json} ---")
+
         # (1) 儲存圖片 + 上傳 R2
         if "image" in request.files:
             image = request.files["image"]
@@ -156,6 +168,9 @@ def save():
             "image": data.get("image"),
         }
         articles_list.insert(0, new_entry)
+        # 💡 重點：將更新後的 list 存回本地端的 articles.json 檔案
+        with open(local_articles_json, "w", encoding="utf-8") as f:
+            json.dump(articles_list, f, ensure_ascii=False, indent=2)
         r2_upload_articles_json(articles_list)
 
         return jsonify({"success": True})
@@ -163,6 +178,57 @@ def save():
         print("ERROR:", e)
         return jsonify({"success": False, "error": str(e)})
 
+# 2. 加入這段 Hook，確保每一個 Response 都帶上 CORS 標頭（解決 Failed to fetch 的萬靈丹）
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-API-KEY')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS')
+    return response
+
+# ===========================
+# DELETE API（同步刪除 R2）
+# ===========================
+@app.route("/delete", methods=["DELETE", "OPTIONS"])
+@jwt_required()
+def delete_article():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True}), 200
+
+    try:
+        from flask_jwt_extended import verify_jwt_in_request
+        verify_jwt_in_request()
+    except Exception as e:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if request.headers.get("X-API-KEY") != API_KEY:
+        return jsonify({"error": "Invalid API Key"}), 401
+
+    filename = request.args.get("filename")
+
+    try:
+        # 1. 取得 R2 最新列表
+        articles_list = r2_download_articles_json()
+        target = next((a for a in articles_list if a["filename"] == filename), None)
+
+        if not target:
+            return jsonify({"error": "找不到文章紀錄"}), 404
+
+        # 2. 產出新列表並上傳覆蓋 R2 索引
+        new_list = [a for a in articles_list if a["filename"] != filename]
+        r2_upload_articles_json(new_list)
+
+        # 3. 從 R2 刪除實體檔案
+        s3 = get_s3_client()
+        s3.delete_object(Bucket=R2_BUCKET, Key=f"articles/{filename}")
+
+        if target.get("image"):
+            s3.delete_object(Bucket=R2_BUCKET, Key=target["image"])
+
+        return jsonify({"success": True})
+    except Exception as e:
+        print("DELETE ERROR:", e)
+        return jsonify({"success": False, "error": str(e)})
 # ===========================
 # MAIN（本地測試）
 # ===========================
