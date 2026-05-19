@@ -3,6 +3,8 @@ import os
 import boto3
 import mimetypes
 import requests
+import io
+from PIL import Image
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -19,12 +21,16 @@ from flask import send_from_directory
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
-print("========== APP START ==========")
 
 IMAGE_FOLDER = "./articles_images"
 NEWS_FOLDER = "./articles"
-os.makedirs(IMAGE_FOLDER, exist_ok=True)
-os.makedirs(NEWS_FOLDER, exist_ok=True)
+
+AD_IMAGE_FOLDER = "./ads_images"
+AD_DATA_FOLDER = "./ads"
+
+# 建立目錄
+for folder in [IMAGE_FOLDER, NEWS_FOLDER, AD_IMAGE_FOLDER, AD_DATA_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
 
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 API_KEY = os.getenv("API_KEY")
@@ -46,8 +52,9 @@ CORS(app, resources={r"/*": {
     "allow_headers": ["Content-Type", "Authorization", "X-API-KEY"]
 }})
 
+
 # ===========================
-# R2 相關函式
+# R2 共用工具函式 (核心重構)
 # ===========================
 def get_s3_client():
     return boto3.client(
@@ -59,10 +66,12 @@ def get_s3_client():
         config=Config(signature_version="s3v4"),
     )
 
-def r2_upload_file(local_path, r2_key):
-    """上傳單一檔案到 R2"""
+
+def r2_upload_file(local_path, r2_key, content_type=None):
+    """通用上傳函式"""
     s3 = get_s3_client()
-    content_type, _ = mimetypes.guess_type(local_path)
+    if not content_type:
+        content_type, _ = mimetypes.guess_type(local_path)
     content_type = content_type or "application/octet-stream"
     with open(local_path, "rb") as f:
         s3.put_object(
@@ -72,93 +81,129 @@ def r2_upload_file(local_path, r2_key):
             ContentType=content_type,
         )
 
-def r2_download_articles_json():
-    """嘗試從 R2 下載 articles.json，不存在回傳空 array"""
+
+def r2_get_json(json_key):
+    """通用 JSON 讀取 (支援 articles.json 或 ads.json)"""
     s3 = get_s3_client()
     try:
-        obj = s3.get_object(Bucket=R2_BUCKET, Key="articles.json")
+        obj = s3.get_object(Bucket=R2_BUCKET, Key=json_key)
         return json.loads(obj["Body"].read().decode("utf-8"))
     except Exception as e:
-        if "NoSuchKey" in str(e):
-            return []
-        print("讀取 R2 articles.json 失敗:", e)
+        if "NoSuchKey" in str(e): return []
         return []
 
-def r2_upload_articles_json(content_list):
-    """上傳主檔 articles.json"""
+
+def r2_set_json(json_key, data_list):
+    """通用 JSON 寫入"""
     s3 = get_s3_client()
     s3.put_object(
         Bucket=R2_BUCKET,
-        Key="articles.json",
-        Body=json.dumps(content_list, ensure_ascii=False, indent=2),
+        Key=json_key,
+        Body=json.dumps(data_list, ensure_ascii=False, indent=2),
         ContentType="application/json",
     )
 
 # ===========================
-# KV 相關函式
+# 檢查原圖寬度
 # ===========================
-def kv_get_user(username):
-    """從 Cloudflare KV 讀取帳號資料"""
-    url = f"{KV_BASE_URL}/user:{username}"
-    response = requests.get(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"})
-    if response.status_code == 404:
-        return None
-    return json.loads(response.text)
+def process_and_resize_image(image_file, max_width=800):
+    """
+    讀取圖片、等比例縮放到指定寬度、並轉換為 RGB (準備存 WebP)
+    """
+    img = Image.open(image_file)
+    orig_w, orig_h = img.size
+
+    # 如果寬度超過設定值，才進行縮放
+    if orig_w > max_width:
+        ratio = max_width / float(orig_w)
+        new_h = int(float(orig_h) * float(ratio))
+        # 使用 LANCZOS 獲得最佳縮放品質
+        img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+
+    # WebP 存檔前建議統一轉為 RGB
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+
+    return img
 
 # ===========================
-# 登入 API
+# KV 相關 (不變)
+# ===========================
+def kv_get_user(username):
+    url = f"{KV_BASE_URL}/user:{username}"
+    response = requests.get(url, headers={"Authorization": f"Bearer {CF_API_TOKEN}"})
+    if response.status_code == 404: return None
+    return json.loads(response.text)
+
+
+# ===========================
+# 登入 API (不變)
 # ===========================
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json
     username = data.get("username")
     password = data.get("password")
-
     user = kv_get_user(username)
     if user and check_password_hash(user["password_hash"], password):
         return jsonify({"token": create_access_token(identity=username)})
-    else:
-        return jsonify({"error": "invalid credentials"}), 401
+    return jsonify({"error": "invalid credentials"}), 401
+
 
 # ===========================
-# SAVE API（上傳文章 + 圖片 + 主檔）
+# 文章 SAVE API (維持原欄位)
 # ===========================
-@app.route("/save", methods=["POST"])
+@app.route("/save", methods=["POST", "OPTIONS"])
 @jwt_required()
 def save():
-    print("JWT ok, checking API Key...", request.headers.get("X-API-KEY"))
+    if request.method == "OPTIONS": return jsonify({"success": True}), 200
     if request.headers.get("X-API-KEY") != API_KEY:
         return jsonify({"error": "Invalid API Key"}), 401
 
     try:
         raw_data = request.form.get("data")
         data = json.loads(raw_data)
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
 
-        # 定義路徑（確保這幾行在最前面）
-        local_articles_json = os.path.join(os.getcwd(), "articles.json")
-        print(f"--- 準備寫入索引檔: {local_articles_json} ---")
-
-        # (1) 儲存圖片 + 上傳 R2
-        if "image" in request.files:
-            image = request.files["image"]
-            img_filename = f"{timestamp}_{image.filename}"
-            local_img_path = os.path.join(IMAGE_FOLDER, img_filename)
-            image.save(local_img_path)
-            data["image"] = f"articles_images/{img_filename}"
-            r2_upload_file(local_img_path, data["image"])
+        # 💡 [第一步] 這裡利用前端傳來的原始 data 做編輯判定（完全沒被破壞）
+        existing_filename = data.get("filename")
+        if existing_filename:
+            post_filename = existing_filename  # 編輯模式：沿用舊檔名
         else:
-            data["image"] = None
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            post_filename = f"news_{timestamp}.json"  # 新增模式：產生新檔名
 
-        # (2) 儲存個別文章 JSON + 上傳 R2
-        post_filename = f"news_{timestamp}.json"
+        # (1) 圖片處理：轉 WebP + 寬度 800px
+        if "image" in request.files:
+            image_file = request.files["image"]
+            img = process_and_resize_image(image_file, max_width=800)
+
+            img_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            webp_filename = f"{img_timestamp}_article.webp"
+            local_webp_path = os.path.join(IMAGE_FOLDER, webp_filename)
+            img.save(local_webp_path, "webp", quality=80)
+
+            data["image"] = f"articles_images/{webp_filename}"
+            r2_upload_file(local_webp_path, data["image"], content_type="image/webp")
+        else:
+            if existing_filename:
+                old_list = r2_get_json("articles.json")
+                old_entry = next((a for a in old_list if a["filename"] == existing_filename), None)
+                if old_entry:
+                    data["image"] = old_entry.get("image")
+
+        # 💡 [第二步] 在判定結束後、準備寫入檔案前，強行把正確的檔名塞回 data 中！
+        # 這樣如果是新文章（原本 filename 為 null），此處就會被更正為新產生的檔名。
+        # 如果是編輯文章，此處就是把舊檔名再次確認填入，完全不衝突。
+        data["filename"] = post_filename
+
+        # (2) 儲存個別文章 JSON
         local_post_path = os.path.join(NEWS_FOLDER, post_filename)
         with open(local_post_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         r2_upload_file(local_post_path, f"articles/{post_filename}")
 
-        # (3) 更新 articles.json
-        articles_list = r2_download_articles_json()
+        # (3) 更新 articles.json (索引檔)
+        articles_list = r2_get_json("articles.json")
         new_entry = {
             "filename": post_filename,
             "title": data.get("title"),
@@ -166,19 +211,153 @@ def save():
             "content": data.get("content"),
             "date": data.get("date"),
             "image": data.get("image"),
+            "linkText": data.get("linkText"),
+            "linkUrl": data.get("linkUrl"),
+            "keywords": data.get("keywords"),
+            "extraSections": data.get("extraSections"),
+            "deployDomains": data.get("deployDomains")
         }
+
+        if existing_filename:
+            articles_list = [a for a in articles_list if a["filename"] != existing_filename]
+
         articles_list.insert(0, new_entry)
-        # 💡 重點：將更新後的 list 存回本地端的 articles.json 檔案
-        with open(local_articles_json, "w", encoding="utf-8") as f:
-            json.dump(articles_list, f, ensure_ascii=False, indent=2)
-        r2_upload_articles_json(articles_list)
+        r2_set_json("articles.json", articles_list)
 
         return jsonify({"success": True})
     except Exception as e:
-        print("ERROR:", e)
         return jsonify({"success": False, "error": str(e)})
 
-# 2. 加入這段 Hook，確保每一個 Response 都帶上 CORS 標頭（解決 Failed to fetch 的萬靈丹）
+
+# ===========================
+# 廣告 SAVE API (新增：含 WebP 壓縮)
+# ===========================
+@app.route("/save_ad", methods=["POST", "OPTIONS"])
+@jwt_required()
+def save_ad():
+    if request.method == "OPTIONS": return jsonify({"success": True}), 200
+    if request.headers.get("X-API-KEY") != API_KEY:
+        return jsonify({"error": "Invalid API Key"}), 401
+
+    try:
+        raw_data = request.form.get("data")
+        data = json.loads(raw_data)
+
+        # 💡 關鍵 1：判斷是「新增」還是「編輯」
+        existing_filename = data.get("filename")  # 前端傳來的 editFilename
+
+        if existing_filename:
+            # 編輯模式：延用舊檔名
+            ad_filename = existing_filename
+        else:
+            # 新增模式：產生新檔名
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            ad_filename = f"ad_{timestamp}.json"
+
+        # (1) 處理圖片
+        if "image" in request.files:
+            # 使用者有上傳新圖片
+            image_file = request.files["image"]
+            img = process_and_resize_image(image_file, max_width=800)
+
+            # 為了避免快取問題，即便是編輯，圖片檔名可以加個小標記或維持原樣
+            # 這裡建議使用時間戳記確保圖片唯一
+            img_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            webp_filename = f"{img_timestamp}_ad.webp"
+            local_webp_path = os.path.join(AD_IMAGE_FOLDER, webp_filename)
+            img.save(local_webp_path, "webp", quality=80)
+
+            data["image"] = f"ads_images/{webp_filename}"
+            r2_upload_file(local_webp_path, data["image"], content_type="image/webp")
+        else:
+            # 💡 關鍵 2：編輯模式下若沒傳新圖，需保留 R2 上的舊圖路徑
+            if existing_filename:
+                old_ads = r2_get_json("ads.json")
+                old_entry = next((a for a in old_ads if a["filename"] == existing_filename), None)
+                if old_entry:
+                    data["image"] = old_entry.get("image")
+
+        # 💡 核心修正：在寫入子層檔案前，強行把本次最終確定的 ad_filename 塞進 data 物件中！
+        # 這樣不管是新廣告（原本為 null）還是編輯廣告，子層 JSON 內的 filename 就絕對會有值。
+        data["filename"] = ad_filename
+
+        # (2) 儲存/覆蓋個別廣告 JSON
+        local_ad_path = os.path.join(AD_DATA_FOLDER, ad_filename)
+        with open(local_ad_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        r2_upload_file(local_ad_path, f"ads/{ad_filename}")
+
+        # (3) 更新 ads.json (索引檔)
+        ads_list = r2_get_json("ads.json")
+
+        new_entry = {
+            "filename": ad_filename,
+            "title": data.get("title"),
+            "intro": data.get("intro"),
+            "link": data.get("link"),
+            "date": data.get("date"),
+            "keywords": data.get("keywords"),
+            "image": data.get("image"),
+        }
+
+        # 💡 關鍵 3：如果是編輯，先刪除舊的再插入新的，或直接替換
+        if existing_filename:
+            # 濾掉舊的，把新的塞在最前面 (或維持原位)
+            ads_list = [a for a in ads_list if a["filename"] != existing_filename]
+
+        ads_list.insert(0, new_entry)
+        r2_set_json("ads.json", ads_list)
+
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+# ===========================
+# DELETE API (文章與廣告共用邏輯)
+# ===========================
+def generic_delete(json_key, filename, folder_prefix):
+    """通用刪除邏輯內部函式"""
+    try:
+        data_list = r2_get_json(json_key)
+        target = next((a for a in data_list if a["filename"] == filename), None)
+        if not target: return False, "找不到紀錄"
+
+        # 更新索引
+        new_list = [a for a in data_list if a["filename"] != filename]
+        r2_set_json(json_key, new_list)
+
+        # 刪除 R2 檔案
+        s3 = get_s3_client()
+        s3.delete_object(Bucket=R2_BUCKET, Key=f"{folder_prefix}/{filename}")
+        if target.get("image"):
+            s3.delete_object(Bucket=R2_BUCKET, Key=target["image"])
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+@app.route("/delete", methods=["DELETE", "OPTIONS"])
+@jwt_required()
+def delete_article():
+    if request.method == "OPTIONS": return jsonify({"success": True}), 200
+    if request.headers.get("X-API-KEY") != API_KEY: return jsonify({"error": "Invalid API Key"}), 401
+
+    filename = request.args.get("filename")
+    success, error = generic_delete("articles.json", filename, "articles")
+    return jsonify({"success": success, "error": error})
+
+
+@app.route("/delete_ad", methods=["DELETE", "OPTIONS"])
+@jwt_required()
+def delete_ad():
+    if request.method == "OPTIONS": return jsonify({"success": True}), 200
+    if request.headers.get("X-API-KEY") != API_KEY: return jsonify({"error": "Invalid API Key"}), 401
+
+    filename = request.args.get("filename")
+    success, error = generic_delete("ads.json", filename, "ads")
+    return jsonify({"success": success, "error": error})
+
+
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -186,53 +365,7 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS')
     return response
 
-# ===========================
-# DELETE API（同步刪除 R2）
-# ===========================
-@app.route("/delete", methods=["DELETE", "OPTIONS"])
-@jwt_required()
-def delete_article():
-    if request.method == "OPTIONS":
-        return jsonify({"success": True}), 200
 
-    try:
-        from flask_jwt_extended import verify_jwt_in_request
-        verify_jwt_in_request()
-    except Exception as e:
-        return jsonify({"error": "Unauthorized"}), 401
-
-    if request.headers.get("X-API-KEY") != API_KEY:
-        return jsonify({"error": "Invalid API Key"}), 401
-
-    filename = request.args.get("filename")
-
-    try:
-        # 1. 取得 R2 最新列表
-        articles_list = r2_download_articles_json()
-        target = next((a for a in articles_list if a["filename"] == filename), None)
-
-        if not target:
-            return jsonify({"error": "找不到文章紀錄"}), 404
-
-        # 2. 產出新列表並上傳覆蓋 R2 索引
-        new_list = [a for a in articles_list if a["filename"] != filename]
-        r2_upload_articles_json(new_list)
-
-        # 3. 從 R2 刪除實體檔案
-        s3 = get_s3_client()
-        s3.delete_object(Bucket=R2_BUCKET, Key=f"articles/{filename}")
-
-        if target.get("image"):
-            s3.delete_object(Bucket=R2_BUCKET, Key=target["image"])
-
-        return jsonify({"success": True})
-    except Exception as e:
-        print("DELETE ERROR:", e)
-        return jsonify({"success": False, "error": str(e)})
-# ===========================
-# MAIN（本地測試）
-# ===========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print("Starting server on port:", port)
     app.run(host="0.0.0.0", port=port)
