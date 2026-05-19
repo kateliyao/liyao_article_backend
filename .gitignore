@@ -4,5 +4,7 @@ __pycache__/
 *.json
 articles/
 articles_images/
+ads/
+ads_images/
 create_user.py
 *.db
