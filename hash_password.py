@@ -4,8 +4,8 @@ import json
 
 # 假設要建立的帳號與密碼對應
 users = {
-    "sa": "XXXX",
-    "LY001": "XXXX"
+    "lda1": "lidadmin1",
+    "lda2": "lidadmin2"
 }
 
 hashed_users = {}
