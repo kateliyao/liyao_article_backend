@@ -298,6 +298,7 @@ def save_ad():
             "date": data.get("date"),
             "keywords": data.get("keywords"),
             "image": data.get("image"),
+            "deployDomains": data.get("deployDomains")
         }
 
         # 💡 關鍵 3：如果是編輯，先刪除舊的再插入新的，或直接替換
